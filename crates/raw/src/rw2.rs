@@ -67,7 +67,8 @@
 //!   JPEG/raw brightness ratio matches normal shots of the same bodies only then], the Digilux 3 records 4095 but
 //!   saturates at 15871 of 16383, and the GF1 records 16383 for 12-bit samples.
 //! - Samples of 0 mark mapped-out defects (format 4 above; isolated zeros between normal neighbours in the 16-bit
-//!   files) and are interpolated from the same colour two pixels away.
+//!   files and in format 2, the DMC-FZ8) and are interpolated from the same colour two pixels away. Formats 5 and 7
+//!   have no zeros, so their samples are left as stored.
 //! - The CFA pattern applies at sample (0, 0) of the data, not at the sensor borders [the two files with odd borders
 //!   show the greens on the diagonal this predicts]; red and blue were checked against every file's JPEG.
 //! - Active area: the sensor borders. Default crop: `0x002f`–`0x0032`, the in-camera aspect ratio (e.g. 4:3 or 1:1
@@ -615,10 +616,15 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode, limits: &Limits) -> Result<RawIma
         }
         _ => Rect::new(0, 0, active.width, active.height),
     };
-    // Packed formats 2/5/7 are lossless sample containers: zero is an ordinary
-    // code, not evidence of a mapped-out photosite. The documented zero repair
-    // applies to the predictive format 4 and older word containers only.
-    if !data.is_empty() && matches!(encoding, Encoding::Words | Encoding::Blocks { kind: Block::Format4, .. }) {
+    // Formats 5 and 7 are lossless sample containers: zero is an ordinary code, not evidence of a mapped-out
+    // photosite (no sample of either has one). The zero repair applies to the predictive format 4, the older word
+    // containers and format 2, whose DMC-FZ8 sample holds 15 zeros between neighbours of 170 to 2070.
+    let marks_defects = match encoding {
+        Encoding::Words | Encoding::Blocks { kind: Block::Format4, .. } => true,
+        Encoding::Blocks { kind: Block::Packed { .. }, .. } => ifd0.u16(RAW_FORMAT) == Some(2),
+        _ => false,
+    };
+    if !data.is_empty() && marks_defects {
         fill_defects(&mut data, w, active);
     }
 
@@ -1110,13 +1116,25 @@ mod tests {
     #[test]
     fn lossless_packed_formats_preserve_zero_codes_inside_the_active_area() {
         let (w, h) = (90usize, 12usize);
-        for (format, bits, rotated) in [(5u16, 12u32, true), (5, 14, true), (7, 14, false), (2, 12, false)] {
+        for (format, bits, rotated) in [(5u16, 12u32, true), (5, 14, true), (7, 14, false)] {
             let mut px = vec![1000u16; w * h];
             px[5 * w + 20] = 0;
             let payload = pack(&px, bits);
             let bytes = rw2(w as u16, h as u16, bits as u16, format, 100, &if rotated { rotate(payload) } else { payload });
             assert_eq!(samples(&crate::decode(&bytes).unwrap()), px, "format {format}/{bits}");
         }
+    }
+
+    /// The DMC-FZ8's format 2 marks its mapped-out photosites with a 0 between neighbours of 170 to 2070 (15 in its
+    /// CC0 sample, none below the black level of 15), so the zero is repaired like format 4's.
+    #[test]
+    fn format_2_zero_markers_are_repaired_from_the_same_colour_neighbours() {
+        let (w, h) = (90usize, 12usize);
+        let mut px = vec![1000u16; w * h];
+        px[5 * w + 20] = 0;
+        let bytes = rw2(w as u16, h as u16, 12, 2, 100, &pack(&px, 12));
+        px[5 * w + 20] = 1000;
+        assert_eq!(samples(&crate::decode(&bytes).unwrap()), px);
     }
 
     #[test]
